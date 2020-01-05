@@ -1,0 +1,349 @@
+#!/user/bin/python
+#-*-coding:utf-8-*-
+from abaqus import *
+from abaqusConstants import *
+from caeModules import *
+from driverUtils import executeOnCaeStartup
+import displayGroupOdbToolset as dgo
+import customKernel
+import numpy as np
+import sketch
+import part
+import assembly
+import material
+import visualization
+from math import *
+
+#【输入参数】
+modelName = "Model-1"                 #部件所在模型名称
+length = 0.1
+height = 1
+thick = 0.1
+dx = 0.01
+appres = 200000000
+nt = 10
+delta = 3.015*dx
+radij = dx/2.0
+area = dx*dx
+vol = area*dx
+alpha = 0.000034
+dtemp = 0
+dt = 1
+totime = nt*dt
+totnode = 0
+bcs = []
+nodes = []
+nodefam = []
+
+m = mdb.models[modelName]           #模型
+#读取材料信息
+for materialName, materialObj in m.materials.items():
+    emod = materialObj.elastic.table[0][0]
+    bc = 12.0*emod/(pi*(delta**4))
+    bcs.append({materialName:bc})
+print('Material reading completed!')
+
+#读取单元材料信息，计算单元质心坐标
+for partName in m.parts.keys():
+    p = m.parts[partName]               #部件
+    s = p.sectionAssignments           #部件截面
+    n = p.nodes                               #部件节点
+    #读取单元材料信息
+    for ss in s:
+        secName = ss.sectionName
+        matName = m.sections[secName].material
+        setName = ss.region[0]
+        eles = p.sets[setName].elements
+        for ele in eles:
+            totnode += 1
+            node = {}
+            xsum = 0
+            ysum = 0
+            zsum = 0
+            node['material'] = matName
+            #计算单元质心坐标
+            nodeNum = len(ele.connectivity)  # 构成单元的节点数量
+            # 遍历单元的所有构成节点
+            for en in ele.connectivity:
+                xsum += n[en].coordinates[0]  # x坐标求和
+                ysum += n[en].coordinates[1]  # y坐标求和
+                zsum += n[en].coordinates[2]  # z坐标求和
+            node['x_position'] = xsum / nodeNum  # 单元中心处x坐标
+            node['y_position'] = ysum / nodeNum  # 单元中心处y坐标
+            node['z_position'] = zsum / nodeNum  # 单元中心处z坐标
+            if node['y_position'] >= height-dx:
+                node['loadflag'] = 1
+            else:
+                node['loadflag'] = 0
+            if node['y_position'] > 0:
+                node['integralflag'] = 1
+            else:
+                node['integralflag'] = 0
+            node['numfam'] = 0
+            node['velhalfold_x'] = 0
+            node['velhalfold_y'] = 0
+            node['velhalfold_z'] = 0
+            node['bforce_x'] = 0
+            node['bforce_y'] = 0
+            node['bforce_z'] = 0
+            nodes.append(node)
+print('nodes position completed!')
+
+#计算点的family
+for i in range(0,totnode):
+    for j in range(0,totnode):
+        idist = sqrt((nodes[i]['x_position']-nodes[j]['x_position'])**2+(nodes[i]['y_position']-nodes[j]['y_position'])**2+(nodes[i]['z_position']-nodes[j]['z_position'])**2)
+        if i != j:
+            if idist <= delta:
+                nodes[i]['numfam'] += 1
+                nodefam.append(j)
+for i in range(0,totnode):
+    if i == 0:
+        nodes[i]['pointfam'] = 0
+    else:
+        nodes[i]['pointfam'] = nodes[i-1]['pointfam']+nodes[i-1]['numfam']
+print('nodes family completed!')
+
+#确定表面修正因子
+#Loading 1
+sedload1 = 0.6*emod*1.0e-6
+for i in range(0,totnode):
+    nodes[i]['disp_x'] = 0.001*nodes[i]['x_position']
+    nodes[i]['disp_y'] = 0.0
+    nodes[i]['disp_z'] = 0.0
+for i in range(0,totnode):
+    nodes[i]['stendens_x'] = 0.0
+    for j in range(0,nodes[i]['numfam']):
+        cnode = nodefam[nodes[i]['pointfam']+j]
+        if nodes[i]['material'] == nodes[cnode]['material']:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc = v
+        else:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc1 = v
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[cnode]['material'] == k:
+                        bc2 = v
+            bc = (bc1+bc2)/2
+        idist = sqrt((nodes[cnode]['x_position']-nodes[i]['x_position'])**2+(nodes[cnode]['y_position']-nodes[i]['y_position'])**2+(nodes[cnode]['z_position']-nodes[i]['z_position'])**2)
+        nlength = sqrt((nodes[cnode]['x_position']+nodes[cnode]['disp_x']-nodes[i]['x_position']-nodes[i]['disp_x'])**2+(nodes[cnode]['y_position']+nodes[cnode]['disp_y']-nodes[i]['y_position']-nodes[i]['disp_y'])**2+(nodes[cnode]['z_position']+nodes[cnode]['disp_z']-nodes[i]['z_position']-nodes[i]['disp_z'])**2)
+        if idist <= delta-radij:
+            fac = 1.0
+        elif idist <= delta+radij:
+            fac = (delta+radij-idist)/(2.0*radij)
+        else:
+            fac = 0.0
+        nodes[i]['stendens_x'] = nodes[i]['stendens_x']+0.5*0.5*bc*((nlength-idist)/idist)**2*idist*vol*fac
+    nodes[i]['fncst_x'] = sedload1/nodes[i]['stendens_x']
+#Loading 2
+sedload2 = 0.6*emod*1.0e-6
+for i in range(0,totnode):
+    nodes[i]['disp_x'] = 0.0
+    nodes[i]['disp_y'] = 0.001*nodes[i]['y_position']
+    nodes[i]['disp_z'] = 0.0
+for i in range(0,totnode):
+    nodes[i]['stendens_y'] = 0.0
+    for j in range(0,nodes[i]['numfam']):
+        cnode = nodefam[nodes[i]['pointfam']+j]
+        if nodes[i]['material'] == nodes[cnode]['material']:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc = v
+        else:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc1 = v
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[cnode]['material'] == k:
+                        bc2 = v
+            bc = (bc1+bc2)/2
+        idist = sqrt((nodes[cnode]['x_position']-nodes[i]['x_position'])**2+(nodes[cnode]['y_position']-nodes[i]['y_position'])**2+(nodes[cnode]['z_position']-nodes[i]['z_position'])**2)
+        nlength = sqrt((nodes[cnode]['x_position']+nodes[cnode]['disp_x']-nodes[i]['x_position']-nodes[i]['disp_x'])**2+(nodes[cnode]['y_position']+nodes[cnode]['disp_y']-nodes[i]['y_position']-nodes[i]['disp_y'])**2+(nodes[cnode]['z_position']+nodes[cnode]['disp_z']-nodes[i]['z_position']-nodes[i]['disp_z'])**2)
+        if idist <= delta-radij:
+            fac = 1.0
+        elif idist <= delta+radij:
+            fac = (delta+radij-idist)/(2.0*radij)
+        else:
+            fac = 0.0
+        nodes[i]['stendens_y'] = nodes[i]['stendens_y']+0.5*0.5*bc*((nlength-idist)/idist)**2*idist*vol*fac
+    nodes[i]['fncst_y'] = sedload2/nodes[i]['stendens_y']
+#Loading 3
+sedload3 = 0.6*emod*1.0e-6
+for i in range(0,totnode):
+    nodes[i]['disp_x'] = 0.0
+    nodes[i]['disp_y'] = 0.0
+    nodes[i]['disp_z'] = 0.001*nodes[i]['z_position']
+for i in range(0,totnode):
+    nodes[i]['stendens_z'] = 0.0
+    for j in range(0,nodes[i]['numfam']):
+        cnode = nodefam[nodes[i]['pointfam']+j]
+        if nodes[i]['material'] == nodes[cnode]['material']:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc = v
+        else:
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[i]['material'] == k:
+                        bc1 = v
+            for c in bcs:
+                for k, v in c.items():
+                    if nodes[cnode]['material'] == k:
+                        bc2 = v
+            bc = (bc1+bc2)/2
+        idist = sqrt((nodes[cnode]['x_position']-nodes[i]['x_position'])**2+(nodes[cnode]['y_position']-nodes[i]['y_position'])**2+(nodes[cnode]['z_position']-nodes[i]['z_position'])**2)
+        nlength = sqrt((nodes[cnode]['x_position']+nodes[cnode]['disp_x']-nodes[i]['x_position']-nodes[i]['disp_x'])**2+(nodes[cnode]['y_position']+nodes[cnode]['disp_y']-nodes[i]['y_position']-nodes[i]['disp_y'])**2+(nodes[cnode]['z_position']+nodes[cnode]['disp_z']-nodes[i]['z_position']-nodes[i]['disp_z'])**2)
+        if idist <= delta-radij:
+            fac = 1.0
+        elif idist <= delta+radij:
+            fac = (delta+radij-idist)/(2.0*radij)
+        else:
+            fac = 0.0
+        nodes[i]['stendens_z'] = nodes[i]['stendens_z']+0.5*0.5*bc*((nlength-idist)/idist)**2*idist*vol*fac
+    nodes[i]['fncst_z'] = sedload3/nodes[i]['stendens_z']
+print('nodes fncst completed!')
+
+#初始化位移和速度
+for i in range(0,totnode):
+    nodes[i]['vel_x'] = 0.0
+    nodes[i]['vel_y'] = 0.0
+    nodes[i]['vel_z'] = 0.0
+    nodes[i]['disp_x'] = 0.0
+    nodes[i]['disp_y'] = 0.0
+    nodes[i]['disp_z'] = 0.0
+print('nodes vel disp completed!')
+
+#稳定质量矢量计算
+for i in range(0,totnode):
+   nodes[i]['massvec_x'] = 0.25*dt*dt*((4.0/3.0)*pi*(delta)**3)*bc/dx
+   nodes[i]['massvec_y'] = 0.25*dt*dt*((4.0/3.0)*pi*(delta)**3)*bc/dx
+   nodes[i]['massvec_z'] = 0.25*dt*dt*((4.0/3.0)*pi*(delta)**3)*bc/dx
+print('nodes mass vector completed!')
+
+#施加荷载
+for i in nodes:
+    if i['loadflag'] == 1:
+        i['bforce_y'] = appres/dx
+print('nodes load completed!')
+
+#时域积分
+for tt in range(1,nt+1):
+    print(tt)
+    for i in range(0,totnode):
+        if nodes[i]['integralflag'] == 1:
+            nodes[i]['pforce_x']=0
+            nodes[i]['pforce_y']=0
+            nodes[i]['pforce_z']=0
+            for j in range(0,nodes[i]['numfam']):
+                cnode = nodefam[nodes[i]['pointfam']+j]
+                if nodes[i]['material'] == nodes[cnode]['material']:
+                    for c in bcs:
+                        for k, v in c.items():
+                            if nodes[i]['material'] == k:
+                                bc = v
+                else:
+                    for c in bcs:
+                        for k, v in c.items():
+                            if nodes[i]['material'] == k:
+                                bc1 = v
+                    for c in bcs:
+                        for k, v in c.items():
+                            if nodes[cnode]['material'] == k:
+                                bc2 = v
+                    bc = (bc1+bc2)/2
+                idist = sqrt((nodes[cnode]['x_position']-nodes[i]['x_position'])**2+(nodes[cnode]['y_position']-nodes[i]['y_position'])**2+(nodes[cnode]['z_position']-nodes[i]['z_position'])**2)
+                nlength = sqrt((nodes[cnode]['x_position']+nodes[cnode]['disp_x']-nodes[i]['x_position']-nodes[i]['disp_x'])**2+(nodes[cnode]['y_position']+nodes[cnode]['disp_y']-nodes[i]['y_position']-nodes[i]['disp_y'])**2+(nodes[cnode]['z_position']+nodes[cnode]['disp_z']-nodes[i]['z_position']-nodes[i]['disp_z'])**2)
+                #体积修正
+                if idist < delta-radij:
+                    fac = 1.0
+                elif idist < delta+radij:
+                    fac = (delta+radij-idist)/(2.0*radij)
+                else:
+                    fac = 0.0
+                #确定两物质点间表面修正因子
+                if abs(nodes[cnode]['z_position']-nodes[i]['z_position']) <= 1.0e-10:
+                    if abs(nodes[cnode]['y_position']-nodes[i]['y_position']) <= 1.0e-10:
+                        theta = 0.0
+                    elif abs(nodes[cnode]['x_position']-nodes[i]['x_position']) <= 1.0e-10:
+                        theta = 90.0*pi/180.0
+                    else:
+                        theta = atan(abs(nodes[cnode]['y_position']-nodes[i]['y_position'])/abs(nodes[cnode]['x_position']-nodes[i]['x_position']))
+                    phi = 90.0*pi/180.0
+                elif abs(nodes[cnode]['x_position']-nodes[i]['x_position']) <= 1.0e-10:
+                    if abs(nodes[cnode]['y_position']-nodes[i]['y_position']) <= 1.0e-10:
+                        phi = 0.0
+                    else:
+                        phi = atan(abs(nodes[cnode]['y_position']-nodes[i]['y_position'])/abs(nodes[cnode]['z_position']-nodes[i]['z_position']))
+                    theta = 90.0*pi/180.0
+                else:
+                    theta = atan(abs(nodes[cnode]['y_position']-nodes[i]['y_position'])/abs(nodes[cnode]['x_position']-nodes[i]['x_position']))
+                    phi = acos(abs(nodes[cnode]['z_position']-nodes[i]['z_position'])/idist)
+                scx = (nodes[i]['fncst_x']+nodes[cnode]['fncst_x'])/2.0
+                scy = (nodes[i]['fncst_y']+nodes[cnode]['fncst_y'])/2.0
+                scz = (nodes[i]['fncst_z']+nodes[cnode]['fncst_z'])/2.0
+                scr = 1.0/(((cos(theta)*sin(phi))**2/(scx)**2)+((sin(theta)*sin(phi))**2/(scy)**2)+((cos(phi))**2/(scz)**2))
+                scr = sqrt(scr)
+                #计算x,y,z方向的近场力
+                #物质点j作用于物质点i
+                dforce1 = bc*((nlength-idist)/idist-(alpha*dtemp))*vol*scr*fac*(nodes[cnode]['x_position']+nodes[cnode]['disp_x']-nodes[i]['x_position']-nodes[i]['disp_x'])/nlength
+                dforce2 = bc*((nlength-idist)/idist-(alpha*dtemp))*vol*scr*fac*(nodes[cnode]['y_position']+nodes[cnode]['disp_y']-nodes[i]['y_position']-nodes[i]['disp_y'])/nlength
+                dforce3 = bc*((nlength-idist)/idist-(alpha*dtemp))*vol*scr*fac*(nodes[cnode]['z_position']+nodes[cnode]['disp_z']-nodes[i]['z_position']-nodes[i]['disp_z'])/nlength
+                nodes[i]['pforce_x'] = nodes[i]['pforce_x'] + dforce1
+                nodes[i]['pforce_y'] = nodes[i]['pforce_y'] + dforce2
+                nodes[i]['pforce_z'] = nodes[i]['pforce_z'] + dforce3
+    #自适应动态松弛
+    cn = 0.0
+    cn1 = 0.0
+    cn2 = 0.0
+    for i in range(0,totnode):
+        if nodes[i]['integralflag'] == 1:
+            if nodes[i]['velhalfold_x'] != 0.0:
+                cn1 = cn1-nodes[i]['disp_x']*nodes[i]['disp_x']*(nodes[i]['pforce_x']/nodes[i]['massvec_x']-nodes[i]['pforceold_x']/nodes[i]['massvec_x'])/(dt*nodes[i]['velhalfold_x'])
+            if nodes[i]['velhalfold_y'] != 0.0:
+                cn1 = cn1-nodes[i]['disp_y']*nodes[i]['disp_y']*(nodes[i]['pforce_y']/nodes[i]['massvec_y']-nodes[i]['pforceold_y']/nodes[i]['massvec_y'])/(dt*nodes[i]['velhalfold_y'])
+            if nodes[i]['velhalfold_z'] !=0.0:
+                cn1 = cn1-nodes[i]['disp_z']*nodes[i]['disp_z']*(nodes[i]['pforce_z']/nodes[i]['massvec_z']-nodes[i]['pforceold_z']/nodes[i]['massvec_z'])/(dt*nodes[i]['velhalfold_z'])
+            cn2 = cn2+nodes[i]['disp_x']*nodes[i]['disp_x']
+            cn2 = cn2+nodes[i]['disp_y']*nodes[i]['disp_y']
+            cn2 = cn2+nodes[i]['disp_z']*nodes[i]['disp_z']
+    if cn2 != 0.0:
+        if cn1/cn2 > 0.0:
+            cn = 2.0*sqrt(cn1/cn2)
+        else:
+            cn = 0.0
+    else:
+        cn = 0.0
+    if cn > 2.0:
+        cn = 1.9
+    for i in range(0,totnode):
+        if nodes[i]['integralflag'] == 1:
+            #积分加速度随时间的变化
+            if tt == 1:
+                nodes[i]['velhalf_x'] = 1.0*dt/nodes[i]['massvec_x']*(nodes[i]['pforce_x']+nodes[i]['bforce_x'])/2.0
+                nodes[i]['velhalf_y'] = 1.0*dt/nodes[i]['massvec_y']*(nodes[i]['pforce_y']+nodes[i]['bforce_y'])/2.0
+                nodes[i]['velhalf_z'] = 1.0*dt/nodes[i]['massvec_z']*(nodes[i]['pforce_z']+nodes[i]['bforce_z'])/2.0
+            else:
+                nodes[i]['velhalf_x'] = ((2.0-cn*dt)*nodes[i]['velhalfold_x']+2.0*dt/nodes[i]['massvec_x']*(nodes[i]['pforce_x']+nodes[i]['bforce_x']))/(2.0+cn*dt)
+                nodes[i]['velhalf_y'] = ((2.0-cn*dt)*nodes[i]['velhalfold_y']+2.0*dt/nodes[i]['massvec_y']*(nodes[i]['pforce_y']+nodes[i]['bforce_y']))/(2.0+cn*dt)
+                nodes[i]['velhalf_z'] = ((2.0-cn*dt)*nodes[i]['velhalfold_z']+2.0*dt/nodes[i]['massvec_z']*(nodes[i]['pforce_z']+nodes[i]['bforce_z']))/(2.0+cn*dt)
+            nodes[i]['vel_x'] = 0.5*(nodes[i]['velhalfold_x']+nodes[i]['velhalf_x'])
+            nodes[i]['vel_y'] = 0.5*(nodes[i]['velhalfold_y']+nodes[i]['velhalf_y'])
+            nodes[i]['vel_z'] = 0.5*(nodes[i]['velhalfold_z']+nodes[i]['velhalf_z'])
+            nodes[i]['disp_x'] = nodes[i]['disp_x']+nodes[i]['velhalf_x']*dt
+            nodes[i]['disp_y'] = nodes[i]['disp_y']+nodes[i]['velhalf_y']*dt
+            nodes[i]['disp_z'] = nodes[i]['disp_z']+nodes[i]['velhalf_z']*dt
+            nodes[i]['velhalfold_x'] = nodes[i]['velhalf_x']
+            nodes[i]['velhalfold_y'] = nodes[i]['velhalf_y']
+            nodes[i]['velhalfold_z'] = nodes[i]['velhalf_z']
+            nodes[i]['pforceold_x'] = nodes[i]['pforce_x']
+            nodes[i]['pforceold_y'] = nodes[i]['pforce_y']
+            nodes[i]['pforceold_z'] = nodes[i]['pforce_z']
